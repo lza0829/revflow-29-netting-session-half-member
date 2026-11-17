@@ -256,3 +256,140 @@ def test_single_account_settle_is_incremental_on_top_of_netting(client):
     report = client.post("/api/verify-reports").json()
     assert report["consistent"] == 1
     assert report["ledger_net_cents"] == report["balance_sum_cents"]
+
+
+def test_mid_flight_conflict_rolls_back_all_members(client, monkeypatch):
+    """落库途中任一成员失败：整会话失败闭，正式余额不留半成员污染，不得假完成。"""
+    from app.modules import multi_account_net as svc
+
+    real_build_plan = svc._build_plan
+
+    def tampered_plan(conn, account_ids, entry_ids):
+        plan, reasons = real_build_plan(conn, account_ids, entry_ids)
+        if not reasons and len(plan["accounts"]) >= 2:
+            # 模拟并发：第二名成员的正式余额在事务复核前被外部改写
+            victim = plan["accounts"][1]
+            victim["before_balance_cents"] += 1
+            victim["after_balance_cents"] += 1
+        return plan, reasons
+
+    monkeypatch.setattr(svc, "_build_plan", tampered_plan)
+
+    before = _balances(client)
+    assert client.get("/api/netting-sessions").json() == []
+
+    resp = client.post(
+        "/api/netting-sessions",
+        json={
+            "account_ids": [ACCOUNT_A, ACCOUNT_B],
+            "entry_ids": [1001, 1002, 1003, 1004],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    session = resp.json()
+    # 不得假完成：整会话失败闭
+    assert session["status"] == "失败"
+    assert "余额已变动" in (session["failure_reason"] or "")
+
+    # 正式余额全部保持会话前——包括事务内先更新的第一名成员
+    assert _balances(client) == before
+    entries = {e["id"]: e for e in client.get("/api/entries").json()}
+    for eid in (1001, 1002, 1003, 1004):
+        assert entries[eid]["status"] == "待归并"
+        assert entries[eid]["netting_session_id"] is None
+
+    # 只物化一条失败会话：不留草稿、不假完成
+    sessions = client.get("/api/netting-sessions").json()
+    assert len(sessions) == 1
+    assert sessions[0]["status"] == "失败"
+
+    # 成员快照刷新后与落库一致：无任何成员落账
+    report = client.get(f"/api/netting-sessions/{session['id']}/report").json()
+    assert report["totals"]["applied_count"] == 0
+    assert report["checks"]["applied_all_or_none"] is True
+    assert report["checks"]["failed_no_members_applied"] is True
+    assert all(a["applied"] == 0 for a in report["accounts"])
+
+    # 失败证明同源物化
+    proof = client.get(f"/api/netting-sessions/{session['id']}/proof").json()
+    assert proof["outcome"] == "失败"
+    assert proof["applied_count"] == 0
+    assert proof["member_count"] == 2
+    assert "余额已变动" in proof["failure_reason"]
+    assert all(m["applied"] == 0 for m in proof["members"])
+
+
+def test_netting_session_proof_materialized_for_completed_session(client):
+    """完成会话：证明与会话、成员、余额同源，可按会话 id 只读查询。"""
+    before = _balances(client)
+    session = client.post(
+        "/api/netting-sessions",
+        json={
+            "account_ids": [ACCOUNT_A, ACCOUNT_B],
+            "entry_ids": [1001, 1002, 1003, 1004],
+        },
+    ).json()
+    assert session["status"] == "完成"
+
+    resp = client.get(f"/api/netting-sessions/{session['id']}/proof")
+    assert resp.status_code == 200, resp.text
+    proof = resp.json()
+    assert proof["session_id"] == session["id"]
+    assert proof["outcome"] == "完成"
+    assert proof["member_count"] == 2
+    assert proof["entry_count"] == 4
+    assert proof["net_total_cents"] == 0
+    assert proof["applied_count"] == 2
+    assert proof["failure_reason"] is None
+
+    vector = {m["account_id"]: m["net_cents"] for m in proof["members"]}
+    assert vector == {ACCOUNT_A: 8000, ACCOUNT_B: -8000}
+    members = {m["account_id"]: m for m in proof["members"]}
+    assert members[ACCOUNT_A]["before_balance_cents"] == before[ACCOUNT_A]
+    assert members[ACCOUNT_A]["after_balance_cents"] == before[ACCOUNT_A] + 8000
+    assert members[ACCOUNT_B]["after_balance_cents"] == before[ACCOUNT_B] - 8000
+    assert all(m["applied"] == 1 for m in proof["members"])
+
+    # 证明合计与会话报告（物化行 SQL 复算）同源一致
+    report = client.get(f"/api/netting-sessions/{session['id']}/report").json()
+    assert proof["net_total_cents"] == report["totals"]["member_net_cents"]
+    assert proof["before_sum_cents"] == report["totals"]["before_sum_cents"]
+    assert proof["after_sum_cents"] == report["totals"]["after_sum_cents"]
+    assert proof["applied_count"] == report["totals"]["applied_count"]
+    assert report["checks"]["proof_recorded"] is True
+    assert report["checks"]["proof_matches_members"] is True
+
+
+def test_netting_session_proof_records_failure_closed(client):
+    """失败会话：证明记录成败=失败且零成员落账，正式余额保持会话前。"""
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO ledger_entries(id, entry_key, account_id, kind, amount_cents, biz_ref, target_entry_key, booked_at, status, note)"
+            " VALUES (1011, 'NT-FWD-A2', ?, '正向', 5000, '', NULL, '2026-11-16T09:00:00Z', '待归并', '')",
+            (ACCOUNT_A,),
+        )
+        conn.execute(
+            "INSERT INTO ledger_entries(id, entry_key, account_id, kind, amount_cents, biz_ref, target_entry_key, booked_at, status, note)"
+            " VALUES (1012, 'NT-REV-B2', ?, '冲正', 5000, '', 'NT-MISSING', '2026-11-16T09:10:00Z', '待归并', '')",
+            (ACCOUNT_B,),
+        )
+        conn.commit()
+
+    before = _balances(client)
+    session = client.post(
+        "/api/netting-sessions",
+        json={"account_ids": [ACCOUNT_A, ACCOUNT_B], "entry_ids": [1011, 1012]},
+    ).json()
+    assert session["status"] == "失败"
+
+    proof = client.get(f"/api/netting-sessions/{session['id']}/proof").json()
+    assert proof["outcome"] == "失败"
+    assert proof["applied_count"] == 0
+    assert "无原单" in (proof["failure_reason"] or "")
+    assert {m["account_id"] for m in proof["members"]} == {ACCOUNT_A, ACCOUNT_B}
+    assert all(m["applied"] == 0 for m in proof["members"])
+    assert _balances(client) == before
+
+    # 不存在的会话：证明接口同样 404
+    missing = client.get("/api/netting-sessions/99999/proof")
+    assert missing.status_code == 404

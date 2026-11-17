@@ -93,6 +93,32 @@ CREATE TABLE IF NOT EXISTS netting_session_entries (
   signed_cents INTEGER NOT NULL,
   UNIQUE(session_id, entry_id)
 );
+-- 会话证明：会话落库同事务物化，成员账户 / 各户净额 / 会话合计 / 成败的不可变凭证
+CREATE TABLE IF NOT EXISTS netting_session_proofs (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL UNIQUE REFERENCES netting_sessions(id),
+  outcome TEXT NOT NULL,
+  member_count INTEGER NOT NULL DEFAULT 0,
+  entry_count INTEGER NOT NULL DEFAULT 0,
+  net_total_cents INTEGER NOT NULL DEFAULT 0,
+  before_sum_cents INTEGER NOT NULL DEFAULT 0,
+  after_sum_cents INTEGER NOT NULL DEFAULT 0,
+  applied_count INTEGER NOT NULL DEFAULT 0,
+  failure_reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS netting_session_proof_members (
+  id INTEGER PRIMARY KEY,
+  proof_id INTEGER NOT NULL REFERENCES netting_session_proofs(id),
+  session_id INTEGER NOT NULL REFERENCES netting_sessions(id),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  account_code TEXT NOT NULL,
+  before_balance_cents INTEGER NOT NULL,
+  net_cents INTEGER NOT NULL,
+  after_balance_cents INTEGER NOT NULL,
+  applied INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(proof_id, account_id)
+);
 """
 
 # 旧库补列：底座只有 settle_runs，本轮新增轧差会话指针列

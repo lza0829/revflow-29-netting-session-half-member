@@ -29,11 +29,13 @@ def get_session(session_id: int):
 
 @router.get("/netting-sessions/{session_id}/report")
 def get_session_report(session_id: int):
-    report = svc.session_report(session_id)
-    report["applied_all_or_none"] = True
-    report["failed_no_members_applied"] = True
-    report["completed_all_applied"] = True
-    return report
+    return svc.session_report(session_id)
+
+
+@router.get("/netting-sessions/{session_id}/proof")
+def get_session_proof(session_id: int):
+    """会话证明只读接口：成员账户、各户净额、会话合计、成败，按会话 id 查询。"""
+    return svc.get_session_proof(session_id)
 
 
 @router.post("/netting-preview")

@@ -20,6 +20,23 @@ const sessions = [
   { id: 2, status: '完成', account_count: 2, entry_count: 4, net_total_cents: 0, created_at: '2026-11-17T00:00:00Z', finished_at: '2026-11-17T00:00:01Z', failure_reason: null },
   { id: 1, status: '失败', account_count: 2, entry_count: 2, net_total_cents: 52000, created_at: '2026-11-17T00:00:00Z', finished_at: '2026-11-17T00:00:01Z', failure_reason: '冲正 REV-1 无原单' },
 ]
+const proof = {
+  id: 1,
+  session_id: 2,
+  outcome: '完成',
+  member_count: 2,
+  entry_count: 4,
+  net_total_cents: 0,
+  before_sum_cents: 0,
+  after_sum_cents: 0,
+  applied_count: 2,
+  failure_reason: null,
+  created_at: '2026-11-17T00:00:01Z',
+  members: [
+    { id: 1, proof_id: 1, session_id: 2, account_id: 4, account_code: 'ACC-清算-甲', before_balance_cents: 0, net_cents: 8000, after_balance_cents: 8000, applied: 1 },
+    { id: 2, proof_id: 1, session_id: 2, account_id: 5, account_code: 'ACC-清算-乙', before_balance_cents: 0, net_cents: -8000, after_balance_cents: -8000, applied: 1 },
+  ],
+}
 const report = {
   session: sessions[0],
   accounts: [
@@ -75,7 +92,8 @@ beforeEach(() => {
     } else if (opts && opts.method === 'POST') {
       posted = JSON.parse(opts.body)
       body = { ...sessions[0], id: 9, account_count: posted.account_ids.length, entry_count: posted.entry_ids.length }
-    } else if (u.includes('/report')) body = report
+    } else if (u.includes('/proof')) body = proof
+    else if (u.includes('/report')) body = report
     else if (u.includes('/netting-candidates')) body = candidates
     else if (u.includes('/netting-sessions')) body = sessions
     else if (u.includes('/accounts')) body = accounts
@@ -103,6 +121,20 @@ describe('归并台轧差会话', () => {
     expect(text).toContain('80.00') // 会话净额
     expect(text).toContain('同源核对')
     expect(text).toContain('通过')
+  })
+
+  it('会话结果页展示同源物化的会话证明', async () => {
+    const { wrapper } = await mountPage('/settle?session=2')
+    const text = wrapper.text()
+    expect(text).toContain('会话证明 #1')
+    expect(text).toContain('成败')
+    expect(text).toContain('已落账成员')
+    // 证明成员行：各户净额与会话合计来自证明物化表
+    const proofCard = wrapper.find('.proof-card')
+    expect(proofCard.exists()).toBe(true)
+    expect(proofCard.text()).toContain('ACC-清算-甲')
+    expect(proofCard.text()).toContain('ACC-清算-乙')
+    expect(proofCard.text()).toContain('netting_session_proofs')
   })
 
   it('发起会话只提交所选账户与流水，并跳转到结果', async () => {

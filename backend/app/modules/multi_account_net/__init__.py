@@ -1,12 +1,25 @@
 """多账户轧差会话。
 
 逐户归并会在对向冲正中留下多笔中间余额；本模块把「参与户 + 待归并流水」作为
-一个会话，先算会话级净额向量，再以影子余额草稿原子切换：要么全部参与户余额
+一个会话，先算会话级净额向量，再一次事务原子落定：要么全部参与户余额
 按向量一次落定、成员流水统一标已归并，要么整会话失败、正式余额保持会话前。
 
-落库形态：独立轧差会话表（netting_sessions）+ 成员账户快照表
-（netting_session_accounts）+ 成员流水外键表（netting_session_entries，
-entry_id 外键指向 ledger_entries）。会话表同时保存净额向量与失败原因。
+落库形态（择一，本实现选「会话表+成员表」）：独立轧差会话表
+（netting_sessions）+ 成员账户快照表（netting_session_accounts）+ 成员流水
+外键表（netting_session_entries，entry_id 外键指向 ledger_entries）。
+会话表同时保存净额向量与失败原因。
+
+提交路径（择一，本实现选「禁止逐户 commit」）：全员预检通过后，在单个
+BEGIN IMMEDIATE 事务内复核成员流水仍待归并、账户余额仍等于会话前快照，
+然后按净额向量一次更新全部参与户正式余额、统一标成员流水已归并、物化会话
+与会话证明，最后一次 commit；事务中途任何一步失败整体 rollback，正式余额
+与流水状态保持会话前，另起事务物化失败会话 + 成员快照（applied=0）+
+失败证明供追溯。禁止逐户 commit，异常中断不留半成员污染。
+
+会话证明（基线所无实体）：netting_session_proofs（成败 / 成员数 / 流水数 /
+会话合计净额 / 前后余额合计 / 已落账成员数）+ netting_session_proof_members
+（成员账户 / 各户净额 / 前后余额 / 是否落账），与会话、成员快照同事务写入，
+与正式余额同成败；提供按会话 id 查询的只读接口。
 """
 
 from __future__ import annotations
@@ -278,6 +291,89 @@ class _MaterializeConflict(Exception):
     pass
 
 
+def _insert_proof(
+    conn: sqlite3.Connection,
+    session_id: int,
+    outcome: str,
+    failure_reason: str | None,
+    now: str,
+) -> int:
+    """物化会话证明：成员账户、各户净额、会话合计、成败。
+
+    证明行全部读自同事务内刚物化的会话成员快照 / 成员流水（SQL 复算，不做
+    内存加总），并与正式余额写入口同事务提交——完成会话的证明只在全部余额
+    落定后落库，失败会话的证明只在整体回滚后落库，故证明与正式账同成败。
+    """
+    totals = conn.execute(
+        """
+        SELECT COUNT(*) AS member_count,
+               COALESCE(SUM(before_balance_cents), 0) AS before_sum,
+               COALESCE(SUM(after_balance_cents), 0) AS after_sum,
+               COALESCE(SUM(net_cents), 0) AS net_sum,
+               COALESCE(SUM(applied), 0) AS applied_count
+        FROM netting_session_accounts
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    entry_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM netting_session_entries WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()["c"]
+    cur = conn.execute(
+        """
+        INSERT INTO netting_session_proofs(
+          session_id, outcome, member_count, entry_count,
+          net_total_cents, before_sum_cents, after_sum_cents,
+          applied_count, failure_reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            outcome,
+            totals["member_count"],
+            entry_count,
+            totals["net_sum"],
+            totals["before_sum"],
+            totals["after_sum"],
+            totals["applied_count"],
+            failure_reason,
+            now,
+        ),
+    )
+    proof_id = int(cur.lastrowid)
+    members = conn.execute(
+        """
+        SELECT account_id, account_code, before_balance_cents,
+               net_cents, after_balance_cents, applied
+        FROM netting_session_accounts
+        WHERE session_id = ?
+        ORDER BY account_id
+        """,
+        (session_id,),
+    ).fetchall()
+    for m in members:
+        conn.execute(
+            """
+            INSERT INTO netting_session_proof_members(
+              proof_id, session_id, account_id, account_code,
+              before_balance_cents, net_cents, after_balance_cents, applied
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proof_id,
+                session_id,
+                m["account_id"],
+                m["account_code"],
+                m["before_balance_cents"],
+                m["net_cents"],
+                m["after_balance_cents"],
+                m["applied"],
+            ),
+        )
+    return proof_id
+
+
 def create_session(
     account_ids: list[int],
     entry_ids: list[int] | None = None,
@@ -285,17 +381,23 @@ def create_session(
 ) -> dict:
     """发起轧差会话。
 
-    先只读校验并计算影子草稿；任一成员无法配平则整会话失败，只物化失败会话与
-    成员快照，不改正式余额、不改流水状态。校验通过后在同一事务里原子切换：
-    复核流水仍待归并、账户余额仍等于会话前快照，然后一次写入全部余额并向量落定。
+    先只读校验并计算净额向量；任一成员无法配平则整会话失败闭，只物化失败
+    会话、成员快照（applied=0）与失败证明，不改正式余额、不改流水状态。
+    校验通过后在**同一个** BEGIN IMMEDIATE 事务里：复核成员流水仍待归并 →
+    物化会话与成员快照 → 按净额向量一次更新全部参与户正式余额 → 统一标成员
+    流水已归并 → 物化会话证明 → 一次 commit。禁止逐户 commit；中途任何一步
+    失败整体 rollback，正式余额与流水状态保持会话前，另物化失败会话与失败
+    证明供追溯。
     """
     now = _now()
     with connect() as conn:
         plan, reasons = _build_plan(conn, account_ids, entry_ids)
         if reasons:
+            failure = "；".join(reasons)
             session_id = _insert_session(
-                conn, plan, "失败", note, "；".join(reasons), applied=0, now=now
+                conn, plan, "失败", note, failure, applied=0, now=now
             )
+            _insert_proof(conn, session_id, "失败", failure, now)
             conn.commit()
             return get_session(session_id)
 
@@ -311,9 +413,11 @@ def create_session(
                         f"流水 {entry['entry_key']} 已被其他会话占用"
                     )
             session_id = _insert_session(
-                conn, plan, "草稿", note, None, applied=0, now=now
+                conn, plan, "完成", note, None, applied=1, now=now
             )
-            for i, acc in enumerate(plan["accounts"]):
+            # 禁止逐户 commit：全员复核通过后按净额向量一次更新各户正式余额；
+            # 乐观守卫（余额仍等于会话前快照）任一不满足即抛错，整体回滚。
+            for acc in plan["accounts"]:
                 cur = conn.execute(
                     """
                     UPDATE accounts
@@ -331,16 +435,6 @@ def create_session(
                     raise _MaterializeConflict(
                         f"账户 {acc['account_code']} 余额已变动，会话回滚"
                     )
-                conn.execute(
-                    """
-                    UPDATE netting_session_accounts SET applied = 1
-                    WHERE session_id = ? AND account_id = ?
-                    """,
-                    (session_id, acc["account_id"]),
-                )
-                if i == 0:
-                    conn.commit()
-                    conn.execute("BEGIN IMMEDIATE")
             for entry in plan["entries"]:
                 cur = conn.execute(
                     """
@@ -354,22 +448,18 @@ def create_session(
                     raise _MaterializeConflict(
                         f"流水 {entry['entry_key']} 状态已变动，会话回滚"
                     )
-            conn.execute(
-                """
-                UPDATE netting_sessions
-                SET status = '完成', finished_at = ?
-                WHERE id = ?
-                """,
-                (_now(), session_id),
-            )
+            _insert_proof(conn, session_id, "完成", None, now)
             conn.commit()
             return get_session(session_id)
         except (_MaterializeConflict, sqlite3.Error) as exc:
-            plan2, reasons2 = _build_plan(conn, account_ids, entry_ids)
-            failure = "；".join([str(exc)] + [r for r in reasons2 if r != str(exc)])
+            # 失败闭：先整体回滚，正式余额与流水状态保持会话前，绝不留半成员
+            # 污染；再另起事务物化失败会话 + 成员快照（applied=0）+ 失败证明。
+            conn.rollback()
+            failure = str(exc)
             session_id = _insert_session(
-                conn, plan2, "完成", note, failure, applied=1, now=now
+                conn, plan, "失败", note, failure, applied=0, now=now
             )
+            _insert_proof(conn, session_id, "失败", failure, now)
             conn.commit()
             return get_session(session_id)
 
@@ -391,6 +481,34 @@ def list_sessions() -> list[dict]:
 def get_session(session_id: int) -> dict:
     with connect() as conn:
         return _session_payload(conn, session_id)
+
+
+def get_session_proof(session_id: int) -> dict:
+    """会话证明只读接口：按会话 id 查询，只读物化证明表，不写库。"""
+    with connect() as conn:
+        session = conn.execute(
+            "SELECT id FROM netting_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not session:
+            raise HTTPException(404, "轧差会话不存在")
+        proof = conn.execute(
+            "SELECT * FROM netting_session_proofs WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not proof:
+            raise HTTPException(404, "会话证明不存在")
+        out = dict(proof)
+        out["members"] = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT * FROM netting_session_proof_members
+                WHERE proof_id = ?
+                ORDER BY account_id
+                """,
+                (proof["id"],),
+            ).fetchall()
+        )
+        return out
 
 
 def _session_payload(conn: sqlite3.Connection, session_id: int) -> dict:
@@ -491,6 +609,11 @@ def session_report(session_id: int) -> dict:
             """,
             (session_id, session_id),
         ).fetchone()
+        # 会话证明与成员快照同源核对：证明由物化行同事务写入
+        proof = conn.execute(
+            "SELECT * FROM netting_session_proofs WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
 
         totals = {
             "member_count": member_totals["member_count"],
@@ -513,7 +636,9 @@ def session_report(session_id: int) -> dict:
             == totals["member_net_cents"],
             "after_equals_before_plus_net": totals["after_sum_cents"]
             == totals["before_sum_cents"] + totals["member_net_cents"],
-            "applied_all_or_none": True,
+            # 全落或全不落：已落账成员数只能是 0 或全员，由物化行复算，不硬编码
+            "applied_all_or_none": totals["applied_count"]
+            in (0, totals["member_count"]),
             "ledger_matches_members": totals["ledger_signed_cents"]
             == totals["member_net_cents"],
             "ledger_all_marked": (
@@ -535,6 +660,14 @@ def session_report(session_id: int) -> dict:
             "failed_no_members_applied": (
                 session["status"] != "失败" or totals["applied_count"] == 0
             ),
+            # 会话证明已物化，且证明合计与成员快照合计同源一致
+            "proof_recorded": proof is not None,
+            "proof_matches_members": bool(
+                proof
+                and proof["member_count"] == totals["member_count"]
+                and proof["net_total_cents"] == totals["member_net_cents"]
+                and proof["applied_count"] == totals["applied_count"]
+            ),
         }
         return {
             "session": session,
@@ -544,6 +677,7 @@ def session_report(session_id: int) -> dict:
             "checks": checks,
             "source": (
                 "netting_sessions / netting_session_accounts / "
-                "netting_session_entries / ledger_entries / accounts"
+                "netting_session_entries / netting_session_proofs / "
+                "netting_session_proof_members / ledger_entries / accounts"
             ),
         }

@@ -19,6 +19,8 @@ from app.db import connect  # noqa: E402
 TABLES = (
     "verify_reports",
     "quarantine_items",
+    "netting_session_proof_members",
+    "netting_session_proofs",
     "netting_session_entries",
     "netting_session_accounts",
     "netting_sessions",

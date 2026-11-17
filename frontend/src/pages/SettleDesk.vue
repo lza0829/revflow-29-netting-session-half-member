@@ -11,6 +11,7 @@ const candidates = ref([])
 const sessions = ref([])
 const runs = ref([])
 const report = ref(null)
+const proof = ref(null)
 
 const selectedAccounts = ref([])
 const selectedEntries = ref([])
@@ -46,14 +47,22 @@ async function loadBase() {
 async function loadReport() {
   if (!activeSessionId.value) {
     report.value = null
+    proof.value = null
     return
   }
   loadingReport.value = true
   try {
-    report.value = await getJson(`/api/netting-sessions/${activeSessionId.value}/report`)
+    // 会话报告与会话证明同源（同一批物化表），并行只读取回
+    const [r, p] = await Promise.all([
+      getJson(`/api/netting-sessions/${activeSessionId.value}/report`),
+      getJson(`/api/netting-sessions/${activeSessionId.value}/proof`).catch(() => null),
+    ])
+    report.value = r
+    proof.value = p
   } catch (e) {
     err.value = String(e.message || e)
     report.value = null
+    proof.value = null
   } finally {
     loadingReport.value = false
   }
@@ -202,6 +211,8 @@ const checkLabels = {
   completed_all_applied: '完成会话的成员余额全部落账',
   current_balance_matches_after: '未被后续改写的成员当前余额 = 会话后',
   failed_no_members_applied: '失败会话没有任何成员被落账',
+  proof_recorded: '会话证明已物化',
+  proof_matches_members: '会话证明合计 = 成员快照合计',
 }
 </script>
 
@@ -218,7 +229,7 @@ const checkLabels = {
     <div class="panel">
       <h2>发起轧差会话</h2>
       <p class="note-strip">
-        会话可逐户落定；部分成员失败时仍保留已改余额，会话报告以落库为准。
+        全员预检通过后，各户正式余额按净额向量一次落定（禁止逐户提交）；任一成员失败则整会话失败闭，正式余额与流水保持会话前。
       </p>
 
       <div class="field">
@@ -365,9 +376,52 @@ const checkLabels = {
         </div>
 
         <p v-if="report.session.failure_reason" class="msg">
-          失败原因：{{ report.session.failure_reason }}（已落账成员
-          {{ report.totals.applied_count }} 户，正式余额保持会话前）
+          失败原因：{{ report.session.failure_reason }}（失败闭：无任何成员落账，正式余额与流水保持会话前）
         </p>
+
+        <div v-if="proof" class="panel inset proof-card">
+          <h3>会话证明 #{{ proof.id }}</h3>
+          <div class="stats">
+            <div class="stat">
+              <p class="k">成败</p>
+              <p class="v">
+                <span class="tag" :class="proof.outcome === '完成' ? 'on' : 'bad'">{{ proof.outcome }}</span>
+              </p>
+            </div>
+            <div class="stat">
+              <p class="k">成员户 / 流水</p>
+              <p class="v">{{ proof.member_count }} / {{ proof.entry_count }}</p>
+            </div>
+            <div class="stat">
+              <p class="k">会话合计净额（元）</p>
+              <p class="v">{{ yuan(proof.net_total_cents) }}</p>
+            </div>
+            <div class="stat">
+              <p class="k">已落账成员</p>
+              <p class="v">{{ proof.applied_count }} / {{ proof.member_count }}</p>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr><th>户</th><th>会话前（元）</th><th>各户净额（元）</th><th>会话后（元）</th><th>落账</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="m in proof.members" :key="m.account_id">
+                <td class="mono">{{ m.account_code }}</td>
+                <td class="mono">{{ yuan(m.before_balance_cents) }}</td>
+                <td class="mono">{{ yuan(m.net_cents) }}</td>
+                <td class="mono">{{ yuan(m.after_balance_cents) }}</td>
+                <td>
+                  <span class="tag" :class="m.applied ? 'on' : 'bad'">{{ m.applied ? '已落' : '未落' }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="muted-line">
+            证明物化于 netting_session_proofs / netting_session_proof_members，与会话、成员快照、正式余额同事务同成败；生成于 {{ proof.created_at }}。
+          </p>
+        </div>
+        <p v-else class="muted-line">该会话无物化证明。</p>
 
         <h3>逐户会话前后余额</h3>
         <table>
@@ -514,6 +568,8 @@ export default {
   font-size: 13px;
 }
 .panel.inset { background: #f8fafc; margin: 18px 0; }
+.proof-card { border-left: 3px solid var(--accent, #4f46e5); }
+.proof-card h3 { margin-top: 0; }
 .panel h3 {
   margin: 20px 0 10px;
   font-family: var(--display);
